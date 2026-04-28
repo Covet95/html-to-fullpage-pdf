@@ -1,0 +1,23 @@
+{
+  "skill_name": "html-to-fullpage-pdf",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我把桌面上的 electricity-trading-multi-agent-architecture-report.html 转成PDF，不要改变任何内容，我要保真的那种",
+      "expected_output": "调用 scripts/html2pdf.py，在 HTML 同目录生成 -fullpage.png 和 -fullpage.pdf，PNG 宽度 1400px，PDF 与 PNG 视觉完全一致",
+      "files": ["C:/Users/MKS_csy/Desktop/electricity-trading-multi-agent-architecture-report.html"]
+    },
+    {
+      "id": 2,
+      "prompt": "I have an HTML report at C:/reports/dashboard.html, convert it to a long image and also a PDF",
+      "expected_output": "Runs html2pdf.py on the file, outputs dashboard-fullpage.png and dashboard-fullpage.pdf in C:/reports/",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "这个网页导出PDF总是失真，能不能截图再转PDF",
+      "expected_output": "识别用户需要截图转PDF方案，使用 html2pdf.py 的 PNG→PDF 路径，避免浏览器打印失真",
+      "files": []
+    }
+  ]
+}
