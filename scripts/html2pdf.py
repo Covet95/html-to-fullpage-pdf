@@ -1,77 +1,120 @@
 #!/usr/bin/env python3
 """
-html2pdf.py — HTML → Full-Page PNG + PDF Converter
+html2pdf.py - Convert local HTML files to high-quality PDF and screenshots.
 
-Usage:
-  python html2pdf.py <file.html>          # convert one file
-  python html2pdf.py f1.html f2.html ...  # convert multiple files
-  python html2pdf.py                      # open file-picker dialog
-
-Outputs (same directory as input):
-  <stem>-fullpage.png   full-page screenshot at 1400px width
-  <stem>-fullpage.pdf   PDF generated from the PNG (exact visual match)
-
-Requirements:
-  Python 3.x, Pillow  (pip install Pillow)
-  Google Chrome or Microsoft Edge installed at a standard system path
+Default output is a vector PDF (<stem>-vector.pdf). Use --mode raster for the
+legacy screenshot-based PNG/PDF pair, or --mode both to generate all outputs.
 """
 
-import sys
-import os
-import time
-import threading
-import subprocess
-import socket
-import json
+import argparse
 import base64
-import struct
+import functools
 import http.server
-import socketserver
-import urllib.request
+import json
+import os
 from pathlib import Path
+import shutil
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
 
 
-# ── Chrome / Edge locations ───────────────────────────────────────────────────
 CHROME_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",  # macOS
-    "/usr/bin/google-chrome",                                         # Linux
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/usr/bin/google-chrome",
     "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/snap/bin/chromium",
 ]
 
+CSS_DPI = 96
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Convert local HTML files to vector PDF, raster PNG/PDF, or both."
+    )
+    parser.add_argument("html_files", nargs="*", help="Local .html/.htm files")
+    parser.add_argument(
+        "--mode",
+        choices=("vector", "raster", "both"),
+        default="vector",
+        help="Output mode. Default: vector",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1400,
+        help="CSS pixel width used for layout before measuring/exporting. Default: 1400",
+    )
+    parser.add_argument(
+        "--selector",
+        default="body",
+        help="Element used to determine output height. Default: body",
+    )
+    parser.add_argument(
+        "--padding-bottom",
+        type=int,
+        default=0,
+        help="Extra CSS pixels to keep below the measured selector. Default: 0",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=2.0,
+        help="Seconds to wait after navigation for rendering/assets. Default: 2.0",
+    )
+    parser.add_argument(
+        "--device-scale-factor",
+        type=float,
+        default=1.0,
+        help="Raster screenshot scale. Default: 1.0",
+    )
+    return parser.parse_args(argv)
+
 
 def find_chrome():
-    for p in CHROME_PATHS:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(
-        "Chrome/Edge not found. Update CHROME_PATHS in this script."
-    )
+    for path in CHROME_PATHS:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError("Chrome/Edge not found. Update CHROME_PATHS in html2pdf.py.")
 
 
 def find_free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def build_page_url(port, html_path):
+    return f"http://127.0.0.1:{port}/{urllib.parse.quote(Path(html_path).name)}"
 
 
 def start_http_server(directory, port):
-    os.chdir(directory)
-
     class SilentHandler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
-    httpd = socketserver.TCPServer(("", port), SilentHandler)
+    handler = functools.partial(SilentHandler, directory=str(directory))
+    httpd = ReusableTCPServer(("127.0.0.1", port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
-
-# ── Minimal WebSocket client (stdlib only) ────────────────────────────────────
 
 def _ws_handshake(sock, host, path):
     key = base64.b64encode(os.urandom(16)).decode()
@@ -90,16 +133,15 @@ def _ws_handshake(sock, host, path):
 
 def _ws_send(sock, message):
     data = message.encode()
-    n = len(data)
     mask = os.urandom(4)
     masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
     header = b"\x81"
-    if n < 126:
-        header += bytes([0x80 | n])
-    elif n < 65536:
-        header += struct.pack("!BH", 0xFE, n)
+    if len(data) < 126:
+        header += bytes([0x80 | len(data)])
+    elif len(data) < 65536:
+        header += struct.pack("!BH", 0xFE, len(data))
     else:
-        header += struct.pack("!BQ", 0xFF, n)
+        header += struct.pack("!BQ", 0xFF, len(data))
     sock.sendall(header + mask + masked)
 
 
@@ -113,235 +155,307 @@ def _ws_recv(sock):
             buf += chunk
         return buf
 
-    h = read_exact(2)
-    masked = (h[1] & 0x80) != 0
-    length = h[1] & 0x7F
+    header = read_exact(2)
+    opcode = header[0] & 0x0F
+    length = header[1] & 0x7F
+    masked = (header[1] & 0x80) != 0
     if length == 126:
         length = struct.unpack("!H", read_exact(2))[0]
     elif length == 127:
         length = struct.unpack("!Q", read_exact(8))[0]
-    mask_key = read_exact(4) if masked else None
+    mask = read_exact(4) if masked else None
     payload = read_exact(length)
-    if masked:
-        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if opcode == 8:
+        raise ConnectionError("WebSocket closed by peer")
     return payload.decode("utf-8", errors="replace")
 
 
 def _cdp_connect(ws_url):
-    parsed = urllib.request.urlparse(ws_url)
-    host, port_str = parsed.netloc.split(":")
-    sock = socket.create_connection((host, int(port_str)))
+    parsed = urllib.parse.urlparse(ws_url)
+    host, port = parsed.netloc.split(":")
+    sock = socket.create_connection((host, int(port)))
     _ws_handshake(sock, parsed.netloc, parsed.path)
-    sock.settimeout(30)
+    sock.settimeout(60)
     return sock
 
 
-def _cdp_call(sock, cmd_id, method, params=None, timeout=25):
+def _cdp_call(sock, cmd_id, method, params=None, timeout=60):
     _ws_send(sock, json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             data = json.loads(_ws_recv(sock))
-            if data.get("id") == cmd_id:
-                return data.get("result", {})
         except socket.timeout:
-            break
-    return {}
+            continue
+        if data.get("id") != cmd_id:
+            continue
+        if "error" in data:
+            raise RuntimeError(f"{method}: {data['error']}")
+        return data.get("result", {})
+    raise TimeoutError(method)
 
 
-# ── Core screenshot logic ─────────────────────────────────────────────────────
-
-def _wait_for_chrome(debug_port, retries=20):
+def _wait_for_chrome(debug_port, retries=40):
     for _ in range(retries):
         try:
-            with urllib.request.urlopen(
-                f"http://localhost:{debug_port}/json", timeout=2
-            ) as r:
-                return json.loads(r.read())
+            with urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=1) as res:
+                return json.loads(res.read())
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.25)
     raise RuntimeError("Chrome did not start in time")
 
 
-def take_fullpage_screenshot(page_url, png_path, debug_port):
+def _first_page_ws_url(debug_port):
     tabs = _wait_for_chrome(debug_port)
-
-    ws_url = next(
-        (t["webSocketDebuggerUrl"] for t in tabs if t.get("type") == "page"),
-        None,
-    )
-    if not ws_url:
-        raise RuntimeError("No debuggable page tab found")
-
-    # Navigate to the target page
-    sock = _cdp_connect(ws_url)
-    _cdp_call(sock, 10, "Page.navigate", {"url": page_url})
-    time.sleep(3)
-    sock.close()
-
-    # Reconnect (navigation may change the WS URL)
-    tabs = _wait_for_chrome(debug_port, retries=5)
-    ws_url = next(
-        (t["webSocketDebuggerUrl"] for t in tabs if t.get("type") == "page"),
-        ws_url,
-    )
-    sock = _cdp_connect(ws_url)
-
-    # Fix sticky/fixed elements so they don't cause duplicate rendering or extra blank space
-    _cdp_call(sock, 0, "Runtime.evaluate", {
-        "expression": (
-            "document.querySelectorAll('*').forEach(function(el){"
-            "  var s = getComputedStyle(el).position;"
-            "  if (s === 'sticky' || s === 'fixed') el.style.position = 'static';"
-            "});"
-        ),
-        "returnByValue": False,
-    })
-    time.sleep(0.2)
-
-    # Query true page dimensions
-    result = _cdp_call(sock, 1, "Runtime.evaluate", {
-        "expression": (
-            "({w: document.documentElement.scrollWidth,"
-            " h: document.documentElement.scrollHeight})"
-        ),
-        "returnByValue": True,
-    })
-    dims = result.get("result", {}).get("value", {})
-    width = max(dims.get("w", 1400), 1400)
-    height = dims.get("h", 3000)
-
-    # Override device metrics to capture the full page
-    _cdp_call(sock, 2, "Emulation.setDeviceMetricsOverride", {
-        "width": width, "height": height,
-        "deviceScaleFactor": 1, "mobile": False,
-    })
-    time.sleep(0.5)
-
-    # Capture screenshot
-    result = _cdp_call(sock, 3, "Page.captureScreenshot", {
-        "format": "png", "captureBeyondViewport": True,
-    }, timeout=30)
-    sock.close()
-
-    img_data = result.get("data", "")
-    if not img_data:
-        raise RuntimeError("Empty screenshot data returned by Chrome")
-
-    with open(png_path, "wb") as f:
-        f.write(base64.b64decode(img_data))
-
-    # Auto-crop trailing blank rows caused by Chrome viewport height inflation.
-    # Uses max-channel brightness > 100 to detect real content vs dark/light
-    # background gradients (which typically stay below 65 even in dark themes).
-    from PIL import Image as _PILImage
-    _img = _PILImage.open(png_path).convert("RGB")
-    _w, _h = _img.size
-    _content_bottom = _h
-    for _y in range(_h - 1, 0, -1):
-        _samples = [_img.getpixel((_x, _y)) for _x in range(0, _w, 10)]
-        if any(max(_r, _g, _b) > 100 for _r, _g, _b in _samples):
-            _content_bottom = min(_y + 41, _h)
-            break
-    if _content_bottom < _h:
-        _img.crop((0, 0, _w, _content_bottom)).save(png_path)
-        height = _content_bottom
-
-    return width, height
+    for tab in tabs:
+        if tab.get("type") == "page" and tab.get("webSocketDebuggerUrl"):
+            return tab["webSocketDebuggerUrl"]
+    raise RuntimeError("No debuggable Chrome page found")
 
 
-def png_to_pdf(png_path, pdf_path):
-    from PIL import Image
-    img = Image.open(png_path)
-    if img.mode == "RGBA":
-        img = img.convert("RGB")
-    img.save(str(pdf_path), "PDF", resolution=96)
-
-
-# ── Public entry point ────────────────────────────────────────────────────────
-
-def convert(html_file: str):
-    """Convert a single HTML file to full-page PNG + PDF."""
-    p = Path(html_file).resolve()
-    if not p.exists():
-        print(f"[ERROR] File not found: {p}")
-        return False
-
-    png_path = p.parent / f"{p.stem}-fullpage.png"
-    pdf_path = p.parent / f"{p.stem}-fullpage.pdf"
-
-    print(f"\n[html2pdf] {p.name}")
-
-    chrome = find_chrome()
-    http_port = find_free_port()
-    debug_port = find_free_port()
-
-    httpd = start_http_server(str(p.parent), http_port)
-    page_url = f"http://localhost:{http_port}/{p.name}"
-
-    chrome_proc = subprocess.Popen(
+def launch_chrome(chrome_path, debug_port):
+    profile = tempfile.mkdtemp(prefix="html2pdf-chrome-")
+    proc = subprocess.Popen(
         [
-            chrome,
+            chrome_path,
             f"--remote-debugging-port={debug_port}",
+            f"--user-data-dir={profile}",
             "--headless=new",
             "--disable-gpu",
-            "--no-sandbox",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--disable-extensions",
             "about:blank",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    return proc, profile
 
+
+def close_chrome(proc, profile):
+    proc.terminate()
     try:
-        print("  Capturing full-page screenshot...")
-        w, h = take_fullpage_screenshot(page_url, png_path, debug_port)
-        print(f"  PNG  {w} × {h} px  →  {png_path.name}")
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    shutil.rmtree(profile, ignore_errors=True)
 
-        print("  Converting to PDF...")
-        png_to_pdf(png_path, pdf_path)
-        print(f"  PDF  →  {pdf_path.name}")
+
+def prepare_page(debug_port, page_url, width, wait_seconds, device_scale_factor=1.0):
+    sock = _cdp_connect(_first_page_ws_url(debug_port))
+    _cdp_call(sock, 1, "Page.enable")
+    _cdp_call(sock, 2, "Emulation.setDeviceMetricsOverride", {
+        "width": width,
+        "height": 1200,
+        "deviceScaleFactor": device_scale_factor,
+        "mobile": False,
+    })
+    _cdp_call(sock, 3, "Emulation.setEmulatedMedia", {"media": "screen"})
+    _cdp_call(sock, 4, "Page.navigate", {"url": page_url})
+    time.sleep(wait_seconds)
+    _cdp_call(sock, 5, "Runtime.evaluate", {
+        "expression": (
+            "document.querySelectorAll('*').forEach(function(el){"
+            "  var p = getComputedStyle(el).position;"
+            "  if (p === 'sticky' || p === 'fixed') el.style.position = 'static';"
+            "});"
+        )
+    })
+    return sock
+
+
+def measure_content(sock, selector, width, padding_bottom=0):
+    js_selector = json.dumps(selector)
+    result = _cdp_call(sock, 10, "Runtime.evaluate", {
+        "expression": f"""
+        (() => {{
+          const target = document.querySelector({js_selector}) || document.body || document.documentElement;
+          const doc = document.documentElement;
+          const body = document.body || doc;
+          const rect = target.getBoundingClientRect();
+          const bodyRect = body.getBoundingClientRect();
+          const right = Math.ceil(rect.right + window.scrollX);
+          const bottom = Math.ceil(rect.bottom + window.scrollY);
+          const bodyBottom = Math.ceil(bodyRect.bottom + window.scrollY);
+          const trailingBodyGap = Math.max(0, Math.min(80, bodyBottom - bottom));
+          return {{
+            width: Math.max({width}, doc.scrollWidth, body.scrollWidth, right),
+            height: Math.max(1, bottom + trailingBodyGap + {padding_bottom}),
+            selector: {js_selector},
+            target: {{
+              top: rect.top,
+              left: rect.left,
+              width: rect.width,
+              height: rect.height,
+              bottom: rect.bottom,
+              right: rect.right
+            }},
+            trailingBodyGap,
+            scroll: {{
+              width: doc.scrollWidth,
+              height: doc.scrollHeight
+            }}
+          }};
+        }})()
+        """,
+        "returnByValue": True,
+    })
+    value = result.get("result", {}).get("value")
+    if not value:
+        raise RuntimeError("Could not measure page content")
+    return value
+
+
+def print_vector_pdf(sock, pdf_path, width, height):
+    result = _cdp_call(sock, 20, "Page.printToPDF", {
+        "printBackground": True,
+        "landscape": False,
+        "displayHeaderFooter": False,
+        "paperWidth": width / CSS_DPI,
+        "paperHeight": height / CSS_DPI,
+        "marginTop": 0,
+        "marginBottom": 0,
+        "marginLeft": 0,
+        "marginRight": 0,
+        "scale": 1,
+        "preferCSSPageSize": False,
+        "transferMode": "ReturnAsBase64",
+    })
+    data = result.get("data")
+    if not data:
+        raise RuntimeError("Chrome returned an empty PDF")
+    pdf_path.write_bytes(base64.b64decode(data))
+
+
+def capture_raster_png(sock, png_path, width, height, device_scale_factor=1.0):
+    _cdp_call(sock, 30, "Emulation.setDeviceMetricsOverride", {
+        "width": width,
+        "height": height,
+        "deviceScaleFactor": device_scale_factor,
+        "mobile": False,
+    })
+    time.sleep(0.2)
+    result = _cdp_call(sock, 31, "Page.captureScreenshot", {
+        "format": "png",
+        "captureBeyondViewport": True,
+    }, timeout=90)
+    data = result.get("data")
+    if not data:
+        raise RuntimeError("Chrome returned an empty screenshot")
+    png_path.write_bytes(base64.b64decode(data))
+
+
+def png_to_pdf(png_path, pdf_path, resolution):
+    from PIL import Image
+
+    image = Image.open(png_path)
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+    image.save(str(pdf_path), "PDF", resolution=resolution)
+
+
+def convert(html_file, args=None):
+    if args is None:
+        args = parse_args([str(html_file)])
+
+    html_path = Path(html_file).resolve()
+    if not html_path.exists():
+        print(f"[ERROR] File not found: {html_path}")
+        return False
+
+    vector_pdf = html_path.parent / f"{html_path.stem}-vector.pdf"
+    png_path = html_path.parent / f"{html_path.stem}-fullpage.png"
+    raster_pdf = html_path.parent / f"{html_path.stem}-fullpage.pdf"
+
+    print(f"\n[html2pdf] {html_path.name}")
+    chrome = find_chrome()
+    http_port = find_free_port()
+    debug_port = find_free_port()
+    httpd = start_http_server(html_path.parent, http_port)
+    chrome_proc, chrome_profile = launch_chrome(chrome, debug_port)
+
+    sock = None
+    try:
+        page_url = build_page_url(http_port, html_path)
+        sock = prepare_page(
+            debug_port,
+            page_url,
+            args.width,
+            args.wait,
+            device_scale_factor=1.0,
+        )
+        dims = measure_content(sock, args.selector, args.width, args.padding_bottom)
+        width = int(dims["width"])
+        height = int(dims["height"])
+        print(f"  Layout {width} x {height} CSS px using selector {args.selector!r}")
+
+        if args.mode in ("vector", "both"):
+            print("  Writing vector PDF...")
+            print_vector_pdf(sock, vector_pdf, width, height)
+            print(f"  PDF  ->  {vector_pdf.name}")
+
+        if args.mode in ("raster", "both"):
+            print("  Capturing raster screenshot...")
+            capture_raster_png(
+                sock,
+                png_path,
+                width,
+                height,
+                device_scale_factor=args.device_scale_factor,
+            )
+            print(f"  PNG  ->  {png_path.name}")
+            print("  Wrapping PNG in PDF...")
+            png_to_pdf(png_path, raster_pdf, CSS_DPI * args.device_scale_factor)
+            print(f"  PDF  ->  {raster_pdf.name}")
         return True
 
-    except Exception as e:
-        print(f"  [ERROR] {e}")
-        import traceback; traceback.print_exc()
+    except Exception as exc:
+        print(f"  [ERROR] {exc}")
+        import traceback
+        traceback.print_exc()
         return False
 
     finally:
-        chrome_proc.terminate()
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        close_chrome(chrome_proc, chrome_profile)
         httpd.shutdown()
+        httpd.server_close()
 
 
-def main():
-    if len(sys.argv) > 1:
-        results = [convert(arg) for arg in sys.argv[1:]]
-        success = sum(results)
-        print(f"\nDone: {success}/{len(results)} file(s) converted.")
-    else:
-        # Interactive file-picker
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk(); root.withdraw()
-            files = filedialog.askopenfilenames(
-                title="Select HTML file(s)",
-                filetypes=[("HTML files", "*.html *.htm"), ("All files", "*.*")],
-            )
-            if files:
-                for f in files:
-                    convert(f)
-            else:
-                print("No file selected.")
-        except Exception as e:
-            print(f"Error: {e}")
-            print("Usage: python html2pdf.py <file.html>")
-
+def choose_files_interactively():
     try:
-        input("\nPress Enter to exit...")
-    except EOFError:
-        pass
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        return list(filedialog.askopenfilenames(
+            title="Select HTML file(s)",
+            filetypes=[("HTML files", "*.html *.htm"), ("All files", "*.*")],
+        ))
+    except Exception as exc:
+        print(f"Error opening file picker: {exc}")
+        return []
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    files = args.html_files or choose_files_interactively()
+    if not files:
+        print("Usage: python html2pdf.py [--mode vector|raster|both] <file.html> [...]")
+        return 1
+
+    results = [convert(path, args) for path in files]
+    print(f"\nDone: {sum(results)}/{len(results)} file(s) converted.")
+    return 0 if all(results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

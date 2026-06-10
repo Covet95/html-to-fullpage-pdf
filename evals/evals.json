@@ -4,19 +4,25 @@
     {
       "id": 1,
       "prompt": "帮我把桌面上的 electricity-trading-multi-agent-architecture-report.html 转成PDF，不要改变任何内容，我要保真的那种",
-      "expected_output": "调用 scripts/html2pdf.py，在 HTML 同目录生成 -fullpage.png 和 -fullpage.pdf，PNG 宽度 1400px，PDF 与 PNG 视觉完全一致",
+      "expected_output": "调用 scripts/html2pdf.py 默认 vector 模式，在 HTML 同目录生成 -vector.pdf；文字应保持清晰可缩放，不走 PNG 包装 PDF 路径",
       "files": ["C:/Users/MKS_csy/Desktop/electricity-trading-multi-agent-architecture-report.html"]
     },
     {
       "id": 2,
       "prompt": "I have an HTML report at C:/reports/dashboard.html, convert it to a long image and also a PDF",
-      "expected_output": "Runs html2pdf.py on the file, outputs dashboard-fullpage.png and dashboard-fullpage.pdf in C:/reports/",
+      "expected_output": "Runs html2pdf.py --mode both on the file, outputs dashboard-vector.pdf plus dashboard-fullpage.png and dashboard-fullpage.pdf in C:/reports/",
       "files": []
     },
     {
       "id": 3,
       "prompt": "这个网页导出PDF总是失真，能不能截图再转PDF",
-      "expected_output": "识别用户需要截图转PDF方案，使用 html2pdf.py 的 PNG→PDF 路径，避免浏览器打印失真",
+      "expected_output": "识别用户明确要求截图转PDF，使用 html2pdf.py --mode raster 的 PNG→PDF 路径，避免浏览器打印重排",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "这个简历 PDF 很模糊，而且下面有一大段空白，帮我重新导出高清无空白版",
+      "expected_output": "使用默认 vector 模式并指定文档容器 selector（如 --selector .resume），按最终导出宽度测量元素底边后生成 -vector.pdf，避免文字栅格化和底部空白",
       "files": []
     }
   ]

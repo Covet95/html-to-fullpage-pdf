@@ -1,62 +1,52 @@
 # html-to-fullpage-pdf
 
-Convert any HTML file to a full-page screenshot (PNG) and a visually faithful PDF — no layout distortion, no A4 reformatting.
-
-## Why
-
-Browser print-to-PDF reformats content for A4 paper and breaks visual designs. This tool screenshots the page first (like a camera), then wraps that image into a PDF — so what you see in the browser is exactly what you get in the PDF.
+Convert local HTML files to high-quality PDF and optional full-page screenshots without A4 reflow.
 
 ## Output
 
-For each input file, two files are saved **in the same directory as the HTML**:
+For each input file, outputs are saved in the same directory as the HTML.
 
-| File | Description |
-|------|-------------|
-| `<stem>-fullpage.png` | Full-page screenshot, 1400px wide |
-| `<stem>-fullpage.pdf` | PDF generated directly from the PNG |
+| Mode | Files | Notes |
+|------|-------|-------|
+| `vector` (default) | `<stem>-vector.pdf` | Sharp/selectable text via Chrome `Page.printToPDF` |
+| `raster` | `<stem>-fullpage.png`, `<stem>-fullpage.pdf` | Screenshot-based output for long images or image PDFs |
+| `both` | all of the above | Generates both variants |
 
 ## Requirements
 
 - Python 3.x
-- [Pillow](https://pypi.org/project/Pillow/) — `pip install Pillow`
-- Google Chrome or Microsoft Edge installed at a standard system path
+- Google Chrome or Microsoft Edge installed at a standard path
+- Pillow only for `--mode raster` or `--mode both`
 
 ## Usage
 
 ```bash
-# Single file
+# High-quality vector PDF
 python scripts/html2pdf.py "C:/path/to/file.html"
+
+# Screenshot PNG plus PNG-wrapped PDF
+python scripts/html2pdf.py --mode raster "C:/path/to/file.html"
+
+# Avoid bottom blank area by measuring a document wrapper
+python scripts/html2pdf.py --selector ".resume" "resume.html"
 
 # Multiple files
 python scripts/html2pdf.py file1.html file2.html
-
-# Interactive file picker (no arguments)
-python scripts/html2pdf.py
 ```
 
-## How it works
+## Notes
 
-1. Starts a local HTTP server so Chrome loads the HTML with correct relative paths
-2. Launches Chrome headless with remote debugging (CDP)
-3. Fixes sticky/fixed elements to avoid duplicate rendering
-4. Queries the true `scrollHeight` of the page
-5. Sets viewport to full page height and captures a screenshot
-6. Auto-crops trailing blank rows
-7. Converts the PNG to a single-page PDF via Pillow
-
-No external packages beyond Pillow — the CDP WebSocket client is pure stdlib.
+- The script serves the HTML over localhost so relative images/CSS load correctly.
+- Filenames are percent-encoded, so Chinese names and spaces work.
+- It sets the final layout width before measuring content height. This prevents extra bottom whitespace caused by measuring at one width and exporting at another.
+- Use `--mode raster` only when the user wants a screenshot/long image or an image-based PDF; text-heavy PDFs should stay in default vector mode.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| Chrome not found | Update `CHROME_PATHS` at the top of `scripts/html2pdf.py` |
-| `ModuleNotFoundError: PIL` | Run `pip install Pillow` |
-| Page renders incorrectly | HTML may rely on external resources; ensure network access |
-| Very tall pages (>15,000px) | Chrome has memory limits; reduce content or page width |
-
-## Limitations
-
-- Local HTML files only (not live URLs)
-- Single-page PDF output (no pagination)
-- Image-based PDF (text is not selectable)
+| Chrome not found | Update `CHROME_PATHS` in `scripts/html2pdf.py` |
+| PDF text is blurry/noisy | Use default `vector` mode instead of `--mode raster` |
+| Large blank area at bottom | Use `--selector` for the document wrapper, e.g. `.resume` |
+| Content is cut off | Use `body` or add `--padding-bottom 20` |
+| Raster mode cannot import PIL | `pip install Pillow` |
